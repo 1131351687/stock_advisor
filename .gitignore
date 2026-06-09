@@ -20,6 +20,7 @@ env/
 # IDEs and editors
 .vscode/
 .idea/
+.claude/
 
 # Logs and databases
 *.log
