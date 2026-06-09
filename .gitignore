@@ -1,0 +1,58 @@
+# Python bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+*.egg
+pip-wheel-metadata/
+
+# Virtual environments
+venv/
+.venv/
+env/
+.env
+.env.*
+
+# IDEs and editors
+.vscode/
+.idea/
+
+# Logs and databases
+*.log
+启动日志.txt
+*.sqlite3
+*.db
+
+# Testing
+.pytest_cache/
+
+# Coverage
+.coverage
+htmlcov/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# macOS
+.DS_Store
+
+# Windows
+Thumbs.db
+
+# Sensitive files
+secrets.yaml
+credentials.json
+*.pem
+*.key
+
+# Compiled files
+*.so
+*.dll
+
+# Python cache
+__pycache__/
+*.pyc
