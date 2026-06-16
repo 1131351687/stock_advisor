@@ -1,0 +1,1340 @@
+# 克隆自聚宽文章：https://www.joinquant.com/post/74040
+# 标题：多因子模型选股-支持探针模型滚动训练
+# 作者：papacai0606.eth
+
+from jqdata import *
+from jqfactor import *
+import numpy as np
+import pandas as pd
+import pickle
+from six import StringIO, BytesIO
+import talib
+import os
+from datetime import datetime, timedelta  # 正确的导入方式
+
+# =========================
+# 1️⃣ 市场风险监测模块
+# =========================
+class MarketRiskMonitor:
+    def __init__(self):
+        self.SPECIAL_INDS = ['801780', '801050', '801950', '801040']  # 银行、有色、煤炭、钢铁
+        self.risk_history = []
+        self.risk_cache = {}  # 缓存计算结果
+        
+    def calculate_risk_indicators(self, context, date=None):
+        """计算风险指标"""
+        if date is None:
+            yesterday = context.previous_date
+        else:
+            yesterday = date
+            
+        # 缓存检查
+        cache_key = str(yesterday)
+        if cache_key in self.risk_cache:
+            return self.risk_cache[cache_key]
+        
+        # 获取中证全指成分股
+        stocks = get_index_stocks('000985.XSHG', yesterday)
+        stocks = [s for s in stocks if s[0] not in ['4','8'] and s[:2]!='68']
+        
+        if len(stocks) < 100:  # 股票数量太少时不计算
+            return {'risk_level': 0, 'concentration_ratio': 0, 'market_breadth': 0.5}
+            
+        # 获取行业分类
+        ind_map = get_industry(stocks, date=yesterday)
+        stk_to_ind = {}
+        for s in stocks:
+            if s in ind_map and 'sw_l1' in ind_map[s]:
+                stk_to_ind[s] = ind_map[s]['sw_l1']['industry_code']
+        
+        # 获取价格数据
+        price_df = get_price(
+            list(stk_to_ind.keys()),
+            end_date=yesterday,
+            count=40,  # 获取40天数据计算20日均线
+            fields=['close'],
+            panel=False
+        )
+        
+        if price_df.empty or len(price_df) < 20:
+            return {'risk_level': 0, 'concentration_ratio': 0, 'market_breadth': 0.5}
+            
+        # 计算股价在20日均线以上比例
+        pivot = price_df.pivot(index='time', columns='code', values='close')
+        ma20 = pivot.rolling(20).mean()
+        above = (pivot > ma20).astype(float)
+        
+        # 计算最新交易日的行业宽度
+        latest_date = above.index[-1]
+        daily = above.loc[latest_date]
+        
+        ind_breadth = {}
+        for stk, val in daily.items():
+            if stk in stk_to_ind:
+                ind_code = stk_to_ind[stk]
+                if ind_code not in ind_breadth:
+                    ind_breadth[ind_code] = []
+                ind_breadth[ind_code].append(val)
+        
+        # 计算各项指标
+        all_values = []
+        for vals in ind_breadth.values():
+            all_values.extend(vals)
+        market_breadth = np.mean(all_values) if all_values else 0.5
+        
+        # 四大行业集中度
+        special_vals = []
+        for ind in self.SPECIAL_INDS:
+            if ind in ind_breadth and ind_breadth[ind]:
+                special_vals.append(np.mean(ind_breadth[ind]))
+        
+        if not special_vals:
+            return {'risk_level': 0, 'concentration_ratio': 0, 'market_breadth': 0.5}
+            
+        special_avg = np.mean(special_vals)
+        concentration_ratio = special_avg / (market_breadth + 1e-5)
+        
+        # 计算Z分数（过去20天）
+        if len(self.risk_history) >= 20:
+            hist_special = [r['special_avg'] for r in self.risk_history[-20:]]
+            mean_special = np.mean(hist_special)
+            std_special = np.std(hist_special) + 1e-5
+            z_score = (special_avg - mean_special) / std_special
+        else:
+            z_score = 0
+        
+        # 计算风险级别
+        if z_score > 1.0 and concentration_ratio > 1.2 and market_breadth < 0.6:
+            risk_level = 2
+        elif (z_score > 0.8 and concentration_ratio > 1.1) or market_breadth < 0.5:
+            risk_level = 1
+        else:
+            risk_level = 0
+        
+        # 记录历史
+        result = {
+            'date': yesterday,
+            'risk_level': risk_level,
+            'concentration_ratio': concentration_ratio,
+            'market_breadth': market_breadth,
+            'special_avg': special_avg,
+            'z_score': z_score
+        }
+        
+        self.risk_history.append(result)
+        self.risk_cache[cache_key] = result
+        
+        # 只保留最近100天数据
+        if len(self.risk_history) > 100:
+            self.risk_history = self.risk_history[-100:]
+            
+        if len(self.risk_cache) > 20:
+            # 只保留最近20天的缓存
+            keys = list(self.risk_cache.keys())[:-20]
+            for k in keys:
+                del self.risk_cache[k]
+        
+        return result
+
+# =========================
+# 2️⃣ 主策略
+# =========================
+def initialize(context):
+    set_benchmark('000985.XSHG')
+    set_option('use_real_price', True)
+    set_option("avoid_future_data", True)
+    set_slippage(FixedSlippage(0))
+    set_order_cost(OrderCost(open_tax=0, close_tax=0.001, 
+                           open_commission=0.0003, close_commission=0.0003,
+                           close_today_commission=0, min_commission=5), type='stock')
+    log.set_level('order', 'error')
+    
+    g.etf_pool = {
+        'defensive': [
+            '518880.XSHG',  # 黄金
+            '513260.XSHG',  # 美债20年
+            '511010.XSHG',  # 国债ETF
+        ],
+        
+        'balanced': [
+            '518880.XSHG',  # 黄金
+            '513500.XSHG',  # 标普500
+            '162411.XSHE',  # 原油
+        ],
+        
+        'offensive': [
+            '513100.XSHG',  # 纳指
+            '164824.XSHE',  # 印度
+            '513030.XSHG',  # 德国
+            '159866.XSHE',  # 日本
+        ]
+    }
+
+    
+    g.stock_num = 10
+    g.hold_list = []
+    g.yesterday_HL_list = []
+    g.num = 1
+    g.risk_monitor = MarketRiskMonitor()
+    
+    g.SW1 = {
+        '801010': '农林牧渔I', '801020': '采掘I', '801030': '化工I', '801040': '钢铁I',
+        '801050': '有色金属I', '801060': '建筑建材I', '801070': '机械设备I', '801080': '电子I',
+        '801110': '家用电器I', '801120': '食品饮料I', '801150': '医药生物I', '801180': '房地产I',
+        '801190': '金融服务I', '801200': '商业贸易I', '801220': '信息服务I', '801230': '综合I',
+        '801710': '建筑材料I', '801720': '建筑装饰I', '801730': '电气设备I', '801740': '国防军工I',
+        '801750': '计算机I', '801760': '传媒I', '801770': '通信I', '801780': '银行I',
+        '801790': '非银金融I', '801880': '汽车I', '801890': '机械设备I', '801950': '煤炭I',
+        '801960': '石油石化I'
+    }
+    
+    g.industry_code = list(g.SW1.keys())
+    
+     # 新增：因子筛选条件参数
+    g.factor_select_condition = 'all' # 'all', 'any', 'at_least_two'
+    g.factor_list = g.factor_list = ['asset_impairment_loss_ttm', 'cash_flow_to_price_ratio', 'market_cap', 'interest_free_current_liability', 'EBITDA', 'financial_assets', 'gross_profit_ttm', 'net_working_capital', 'non_recurring_gain_loss', 'EBIT', 'sales_to_price_ratio', 'AR', 'ARBR', 'ATR6', 'DAVOL10', 'MAWVAD', 'TVMA6', 'PSY', 'VOL10', 'VDIFF', 'VEMA26', 'VMACD', 'VOL120', 'VOSC', 'VR', 'WVAD', 'arron_down_25', 'arron_up_25', 'BBIC', 'MASS', 'Rank1M', 'single_day_VPT', 'single_day_VPT_12', 'single_day_VPT_6', 'Volume1M', 'capital_reserve_fund_per_share', 'net_asset_per_share', 'net_operate_cash_flow_per_share', 'operating_profit_per_share', 'total_operating_revenue_per_share', 'surplus_reserve_fund_per_share', 'ACCA', 'account_receivable_turnover_days', 'account_receivable_turnover_rate', 'adjusted_profit_to_total_profit', 'super_quick_ratio', 'MLEV', 'debt_to_equity_ratio', 'debt_to_tangible_equity_ratio', 'equity_to_fixed_asset_ratio', 'fixed_asset_ratio', 'intangible_asset_ratio', 'invest_income_associates_to_total_profit', 'long_debt_to_asset_ratio', 'long_debt_to_working_capital_ratio', 'net_operate_cash_flow_to_total_liability', 'net_operating_cash_flow_coverage', 'non_current_asset_ratio', 'operating_profit_to_total_profit', 'roa_ttm', 'roe_ttm', 'Kurtosis120', 'Kurtosis20', 'Kurtosis60', 'sharpe_ratio_20', 'sharpe_ratio_60', 'Skewness120', 'Skewness20', 'Skewness60', 'Variance120', 'Variance20', 'liquidity', 'beta', 'book_to_price_ratio', 'cash_earnings_to_price_ratio', 'cube_of_size', 'earnings_to_price_ratio', 'earnings_yield', 'growth', 'momentum', 'natural_log_of_market_cap', 'boll_down', 'MFI14', 'price_no_fq', 'DAVOL5', 'turnover_volatility', 'CR20', 'leverage', 'ATR14', 'money_flow_20', 'circulating_market_cap', 'VEMA5', 'daily_standard_deviation', 'ROC120', 'BIAS60', 'fifty_two_week_close_rank', 'bear_power']
+    
+    run_daily(prepare_stock_list, '9:05')
+    run_weekly(weekly_adjustment, 1, '9:30')
+    run_daily(check_limit_up, '14:00')
+    run_daily(check_risk, '14:30')
+    
+    
+    
+def select_best_etf(context, etf_list, top_n=3):
+    """选择最佳ETF - 修复上市时间问题"""
+    valid_etfs = []
+    
+    # 过滤未上市的ETF
+    for etf in etf_list:
+        try:
+            info = get_security_info(etf)
+            if info is not None and info.start_date is not None:
+                # 检查该ETF在回测日期是否已上市
+                if info.start_date <= context.previous_date:
+                    valid_etfs.append(etf)
+                else:
+                    log.info(f"跳过未上市ETF: {etf}, 上市日期: {info.start_date}")
+            else:
+                valid_etfs.append(etf)  # 无法获取信息，假定已上市
+        except Exception as e:
+            # 如果获取信息失败，尝试直接获取价格，失败则跳过
+            log.warning(f"检查ETF信息失败: {etf}, 错误: {e}")
+            valid_etfs.append(etf)
+    
+    if not valid_etfs:
+        log.warning("没有可用的上市ETF")
+        return []
+    
+    # 获取价格数据
+    try:
+        df = get_price(
+            valid_etfs, 
+            end_date=context.previous_date,
+            count=20, 
+            fields=['close'], 
+            panel=False
+        )
+    except Exception as e:
+        log.error(f"获取ETF价格数据失败: {e}")
+        return valid_etfs[:top_n] if valid_etfs else []
+    
+    if df.empty:
+        log.warning("ETF价格数据为空")
+        return valid_etfs[:top_n] if valid_etfs else []
+    
+    # 转换数据格式
+    pivot = df.pivot(index='time', columns='code', values='close')
+    
+    # 过滤数据不足的ETF（至少需要5天数据）
+    valid_columns = []
+    for col in pivot.columns:
+        if pivot[col].count() >= 5:  # 至少有5个有效数据点
+            valid_columns.append(col)
+        else:
+            log.info(f"跳过数据不足的ETF: {col}, 有效数据: {pivot[col].count()}天")
+    
+    if not valid_columns:
+        log.warning("没有足够数据的ETF")
+        return valid_etfs[:top_n] if valid_etfs else []
+    
+    # 只使用有足够数据的ETF
+    pivot = pivot[valid_columns]
+    
+    if len(pivot) < 5:
+        log.warning("ETF数据不足5天，返回前{top_n}个")
+        return valid_columns[:top_n]
+    
+    try:
+        # 动量 + 稳定性计算
+        returns = pivot.pct_change().dropna()
+        
+        # 计算动量（20天收益）
+        momentum = pivot.iloc[-1] / pivot.iloc[0] - 1
+        volatility = returns.std()
+        
+        # 计算分数（动量/波动率）
+        score = momentum / (volatility + 1e-5)
+        
+        # 选择最佳ETF
+        best = score.sort_values(ascending=False).head(top_n).index.tolist()
+        
+        if best:
+            log.info(f"选择ETF: {best}, 分数: {score[best].to_dict()}")
+        return best
+        
+    except Exception as e:
+        log.error(f"计算ETF分数失败: {e}")
+        return valid_columns[:top_n] if valid_columns else []
+
+def prepare_stock_list(context):
+    g.hold_list = []
+    for position in list(context.portfolio.positions.values()):
+        stock = position.security
+        g.hold_list.append(stock)
+    
+    if g.hold_list:
+        df = get_price(g.hold_list, end_date=context.previous_date, frequency='daily', 
+                       fields=['close', 'high_limit'], count=1, panel=False, fill_paused=False)
+        df = df[df['close'] == df['high_limit']]
+        g.yesterday_HL_list = list(df.code)
+    else:
+        g.yesterday_HL_list = []
+
+def getStockIndustry(p_stocks, p_industries_type, p_day):
+    dict_stk_2_ind = {}
+    stocks_industry_dict = get_industry(p_stocks, date=p_day)
+    for stock in stocks_industry_dict:
+        if p_industries_type in stocks_industry_dict[stock]:
+            dict_stk_2_ind[stock] = stocks_industry_dict[stock][p_industries_type]['industry_code']
+    return pd.Series(dict_stk_2_ind)
+
+def judge_market_env(context, ma_window=20, slope_window=5):
+    yesterday = context.previous_date
+    trade_days = get_trade_days(end_date=yesterday, count=ma_window + slope_window)
+    start_date = trade_days[0]
+
+    total_money = (
+        get_price('000001.XSHG', start_date=start_date, end_date=yesterday, fields='money')['money'] +
+        get_price('399001.XSHE', start_date=start_date, end_date=yesterday, fields='money')['money']
+    )
+    ma_total = total_money.rolling(ma_window).mean().dropna()
+    change_total = (ma_total.iloc[-1] - ma_total.iloc[-slope_window - 1]) / ma_total.iloc[-slope_window - 1]
+    
+    price_df = get_price('399986.XSHE', end_date=yesterday, count=ma_window, fields='close', skip_paused=True)
+    close_prices = price_df['close']
+    bank_return = close_prices.iloc[-1] / close_prices.iloc[0] 
+    
+    return '存量' if change_total <= 0.1 or bank_return <= 0.9 else '增量'
+
+def preprocess_factors(df, date=None, training=False, train_stats=None):
+    """
+    因子预处理
+    
+    参数:
+    df: 因子数据DataFrame
+    date: 日期（可选，用于日志）
+    training: 是否为训练阶段
+    train_stats: 训练阶段的统计量字典，包含'mean'和'std'
+    """
+    if df.empty:
+        if training:
+            return df, {}
+        return df
+    
+    # 记录原始统计信息
+    if training and date is not None:
+        log.info(f"预处理因子数据，日期: {date}, 股票数量: {len(df)}, 因子数量: {len(df.columns)}")
+        log.info(f"缺失值比例: {(df.isnull().sum() / len(df)).mean():.2%}")
+    
+    # 复制数据避免修改原数据
+    df_processed = df.copy()
+    
+    # 1. 填充缺失值
+    for factor in df_processed.columns:
+        if df_processed[factor].isnull().any():
+            median_val = df_processed[factor].median()
+            df_processed[factor].fillna(median_val, inplace=True)
+    
+    # 2. 去极值（MAD方法）
+    for factor in df_processed.columns:
+        median = df_processed[factor].median()
+        mad = (df_processed[factor] - median).abs().median()
+        if mad > 0:
+            upper_bound = median + 3 * 1.4826 * mad
+            lower_bound = median - 3 * 1.4826 * mad
+            df_processed[factor] = df_processed[factor].clip(lower_bound, upper_bound)
+    
+    # 3. 标准化（只在训练和预测阶段，但不在因子筛选阶段使用）
+    if training:
+        # 计算并返回标准化统计量
+        mean_vals = df_processed.mean(axis=0, skipna=True)
+        std_vals = df_processed.std(axis=0, skipna=True) + 1e-8
+        stats_dict = {
+            'mean': mean_vals,
+            'std': std_vals
+        }
+        
+        # 标准化
+        df_processed = (df_processed - mean_vals) / std_vals
+        
+        if date is not None:
+            log.info(f"标准化后统计: 均值={df_processed.mean().mean():.4f}, 标准差={df_processed.std().mean():.4f}")
+        
+        return df_processed, stats_dict
+    
+    # 如果不是训练阶段，但有训练统计量，则使用训练统计量标准化
+    elif train_stats is not None and 'mean' in train_stats and 'std' in train_stats:
+        mean_vals = train_stats['mean']
+        std_vals = train_stats['std']
+        
+        # 只对齐都存在的列
+        common_cols = [col for col in df_processed.columns if col in mean_vals.index and col in std_vals.index]
+        
+        if common_cols:
+            df_common = df_processed[common_cols]
+            df_processed = (df_common - mean_vals[common_cols]) / (std_vals[common_cols] + 1e-8)
+            
+            if date is not None:
+                log.info(f"使用训练统计量标准化: 共同列数={len(common_cols)}")
+    
+    return df_processed
+
+
+def rank_stocks(context, initial_list):
+    """优化后的排序函数，包含改进的模型参数和因子筛选 - 改为只训练一次"""
+    # 设置全局随机种子
+    np.random.seed(42)
+    import random
+    random.seed(42)
+    
+    # 检查是否有训练好的模型，如果没有则训练
+    if not hasattr(g, 'model_cls_final') or not hasattr(g, 'model_reg_final') or not hasattr(g, 'model_dir_final') or not hasattr(g, 'selected_factors_final'):
+        should_train = True
+        log.info("未找到训练好的模型，开始训练新模型...")
+    else:
+        should_train = False
+        log.info("使用已训练的模型进行预测...")
+    
+    # 获取历史数据用于训练 - 按月获取数据
+    end_date = context.previous_date
+    start_date = end_date - timedelta(days=2 * 365)  # 大约2年
+    all_trade_days = get_trade_days(start_date=start_date, end_date=end_date)
+    
+    # 按月分组，取每月的第一个交易日
+    dateList = []
+    current_month = None
+    for trade_day in all_trade_days:
+        trade_day_date = trade_day.date() if hasattr(trade_day, 'date') else trade_day
+        month_key = (trade_day_date.year, trade_day_date.month)
+        
+        if month_key != current_month:
+            dateList.append(trade_day)
+            current_month = month_key
+    
+    # 保留最后18个月的数据
+    dateList = dateList[-18:]
+    
+    if should_train:
+        log.info(f"开始训练模型，使用{len(dateList)}个月的数据")
+        log.info(f"初始股票数量: {len(initial_list)}")
+        log.info(f"因子数量: {len(g.factor_list)}")
+        
+        # 准备训练数据
+        all_data = []
+        for i in range(len(dateList)-1):
+            date = dateList[i]
+            
+            # 计算未来20个交易日的目标日期
+            future_date = date + timedelta(days=30)  # 预留足够的时间
+            future_trade_days = get_trade_days(start_date=date, end_date=future_date)
+            
+            if len(future_trade_days) < 2:
+                continue
+                
+            # 确保目标日期是交易日
+            target_date = future_trade_days[-1] if len(future_trade_days) > 20 else future_trade_days[-1]
+            
+            if target_date <= date:
+                continue
+                
+            # 获取因子数据
+            factor_data = get_factor_data(initial_list, date)
+            if factor_data.empty:
+                continue
+                
+            # 预处理因子数据
+            try:
+                factor_data, factor_stats = preprocess_factors(factor_data, date, training=True)
+            except Exception as e:
+                log.warning(f"预处理因子数据失败: {e}")
+                factor_data = preprocess_factors(factor_data, date)
+            
+            # 获取起始价格
+            price_start_df = get_price(initial_list, end_date=date, frequency='daily', 
+                                      fields=['close'], count=1, panel=False, fill_paused=False)
+            price_end_df = get_price(initial_list, end_date=target_date, frequency='daily', 
+                                    fields=['close'], count=1, panel=False, fill_paused=False)
+            
+            if price_start_df.empty or price_end_df.empty:
+                continue
+            
+            price_start_series = price_start_df.set_index('code')['close']
+            price_end_series = price_end_df.set_index('code')['close']
+            
+            # 获取共同存在的股票
+            common_stocks = list(set(price_start_series.index) & 
+                               set(price_end_series.index) & 
+                               set(factor_data.index))
+            
+            if len(common_stocks) < 10:
+                continue
+            
+            factor_data = factor_data.loc[common_stocks]
+            price_start_series = price_start_series.loc[common_stocks]
+            price_end_series = price_end_series.loc[common_stocks]
+            
+            # 计算收益
+            returns = (price_end_series / price_start_series - 1)
+            returns.name = 'return'
+            
+            if returns.isnull().all():
+                continue
+            
+            # 生成标签
+            median_return = returns.median()
+            label_class = (returns > median_return).astype(int)
+            
+            returns_clean = returns.copy()
+            returns_clean.fillna(returns_clean.mean(), inplace=True)
+            
+            try:
+                label_reg = returns_clean.rank(pct=True, method='dense')
+            except:
+                if returns_clean.max() > returns_clean.min():
+                    label_reg = (returns_clean - returns_clean.min()) / (returns_clean.max() - returns_clean.min())
+                else:
+                    label_reg = pd.Series(0.5, index=returns_clean.index)
+            
+            if label_reg.isnull().any():
+                label_reg.fillna(0.5, inplace=True)
+            
+            label_dir = (returns > 0).astype(int)
+            
+            # 整合数据
+            data = factor_data.copy()
+            data['return'] = returns
+            data['label_class'] = label_class
+            data['label_reg'] = label_reg
+            data['label_dir'] = label_dir
+            data['trade_date'] = date
+            
+            all_data.append(data)
+        
+        if len(all_data) < 12:  # 至少需要12个月的数据
+            log.warning(f"训练数据不足，只有{len(all_data)}个月的数据，使用原始股票列表")
+            return initial_list
+        
+        train_data = pd.concat(all_data)
+        log.info(f"训练数据总样本数: {len(train_data)}")
+        log.info(f"训练数据形状: {train_data.shape}")
+        
+        log.info(f"分类标签分布: 正样本={train_data['label_class'].mean():.2%}")
+        log.info(f"方向标签分布: 正样本={train_data['label_dir'].mean():.2%}")
+        
+        # 分割训练集和验证集
+        train_data = train_data.sort_values('trade_date')
+        unique_dates = train_data['trade_date'].unique()
+        split_idx = int(len(unique_dates) * 0.7)
+        
+        if split_idx < 2:
+            split_idx = 2
+        
+        train_dates = unique_dates[:split_idx]
+        val_dates = unique_dates[split_idx:]
+        
+        train_mask = train_data['trade_date'].isin(train_dates)
+        val_mask = train_data['trade_date'].isin(val_dates)
+        
+        train_set = train_data[train_mask]
+        val_set = train_data[val_mask]
+        
+        log.info(f"训练集时间范围: {train_dates[0]} 到 {train_dates[-1]}")
+        log.info(f"验证集时间范围: {val_dates[0]} 到 {val_dates[-1]}")
+        log.info(f"训练集样本数: {len(train_set)}, 验证集样本数: {len(val_set)}")
+        
+        exclude_cols = ['return', 'label_class', 'label_reg', 'label_dir', 'trade_date']
+        feature_names = [col for col in train_data.columns if col not in exclude_cols]
+        
+        log.info(f"初始特征数量: {len(feature_names)}")
+        
+        if len(feature_names) == 0:
+            log.warning("无有效特征，使用原始股票列表")
+            return initial_list
+        
+        # 准备训练数据
+        X_train_raw = train_set[feature_names].values.astype('float32')
+        y_train_cls = train_set['label_class'].values.astype('int32')
+        y_train_reg = train_set['label_reg'].values.astype('float32')
+        y_train_dir = train_set['label_dir'].values.astype('int32')
+        
+        X_val_raw = val_set[feature_names].values.astype('float32')
+        y_val_cls = val_set['label_class'].values.astype('int32')
+        y_val_reg = val_set['label_reg'].values.astype('float32')
+        y_val_dir = val_set['label_dir'].values.astype('int32')
+        
+        # 处理缺失值
+        y_train_reg = np.where(np.isnan(y_train_reg), 0.5, y_train_reg)
+        y_val_reg = np.where(np.isnan(y_val_reg), 0.5, y_val_reg)
+        
+        log.info(f"训练集形状: {X_train_raw.shape}, 验证集形状: {X_val_raw.shape}")
+        
+        # 改进的因子筛选逻辑
+        N_ITER = 3
+        N_NOISE = 5
+        
+        # 对原始因子进行标准化，使其与噪声因子在同一尺度上
+        # 计算训练集的均值和标准差
+        train_mean = np.mean(X_train_raw, axis=0, keepdims=True)
+        train_std = np.std(X_train_raw, axis=0, keepdims=True) + 1e-8
+        
+        # 标准化训练集
+        X_train_raw_std = (X_train_raw - train_mean) / train_std
+        # 使用训练集的统计量标准化验证集
+        X_val_raw_std = (X_val_raw - train_mean) / train_std
+        
+        # 提前生成固定噪声矩阵
+        np.random.seed(42)
+        fixed_noise_train = np.random.randn(X_train_raw.shape[0], N_NOISE).astype('float32')
+        np.random.seed(42)
+        fixed_noise_val = np.random.randn(X_val_raw.shape[0], N_NOISE).astype('float32')
+        
+        # 使用累积重要性评分
+        feature_importance_accum = {feat: 0.0 for feat in feature_names}
+        
+        for iter_idx in range(1, N_ITER + 1):
+            # 添加固定噪声特征
+            X_train_aug = np.hstack([X_train_raw_std, fixed_noise_train])
+            X_val_aug = np.hstack([X_val_raw_std, fixed_noise_val])
+            
+            import lightgbm as lgb
+            
+            # 优化模型参数
+            params_cls = {
+                'objective': 'binary', 
+                'metric': 'auc', 
+                'seed': 42,
+                'verbose': -1,
+                'num_leaves': 31,
+                'max_depth': 6,
+                'min_child_samples': 30,
+                'min_child_weight': 0.001,
+                'min_split_gain': 0.0,
+                'lambda_l1': 0.2,
+                'lambda_l2': 0.2,
+                'learning_rate': 0.05,
+                'bagging_fraction': 0.8,
+                'bagging_freq': 5,
+                'feature_fraction': 0.8,
+                'num_threads': 4,
+                'deterministic': True
+            }
+            
+            params_reg = {
+                'objective': 'regression', 
+                'metric': 'rmse', 
+                'seed': 42,
+                'verbose': -1,
+                'num_leaves': 31,
+                'max_depth': 6,
+                'min_child_samples': 30,
+                'min_child_weight': 0.001,
+                'min_split_gain': 0.0,
+                'lambda_l1': 0.2,
+                'lambda_l2': 0.2,
+                'learning_rate': 0.05,
+                'bagging_fraction': 0.8,
+                'bagging_freq': 5,
+                'feature_fraction': 0.8,
+                'num_threads': 4,
+                'deterministic': True
+            }
+            
+            params_dir = {
+                'objective': 'binary', 
+                'metric': 'auc', 
+                'seed': 42,
+                'verbose': -1,
+                'num_leaves': 31,
+                'max_depth': 6,
+                'min_child_samples': 30,
+                'min_child_weight': 0.001,
+                'min_split_gain': 0.0,
+                'lambda_l1': 0.2,
+                'lambda_l2': 0.2,
+                'learning_rate': 0.05,
+                'bagging_fraction': 0.8,
+                'bagging_freq': 5,
+                'feature_fraction': 0.8,
+                'num_threads': 4,
+                'deterministic': True
+            }
+            
+            # 训练分类模型
+            if len(X_val_aug) == 0 or len(y_val_cls) == 0:
+                log.info(f"第{iter_idx}轮筛选 - 分类模型: 无验证集，仅使用训练集")
+                train_data_cls = lgb.Dataset(X_train_aug, y_train_cls)
+                model_cls = lgb.train(params_cls, train_data_cls, 
+                                     num_boost_round=100, verbose_eval=False)
+            else:
+                log.info(f"第{iter_idx}轮筛选 - 分类模型: 使用训练集和验证集")
+                train_data_cls = lgb.Dataset(X_train_aug, y_train_cls)
+                val_data_cls = lgb.Dataset(X_val_aug, y_val_cls, reference=train_data_cls)
+                model_cls = lgb.train(params_cls, train_data_cls, valid_sets=[val_data_cls], 
+                                     num_boost_round=100, early_stopping_rounds=20, verbose_eval=False)
+            
+            # 训练回归模型
+            if len(X_val_aug) == 0 or len(y_val_reg) == 0:
+                log.info(f"第{iter_idx}轮筛选 - 回归模型: 无验证集，仅使用训练集")
+                train_data_reg = lgb.Dataset(X_train_aug, y_train_reg)
+                model_reg = lgb.train(params_reg, train_data_reg, 
+                                     num_boost_round=100, verbose_eval=False)
+            else:
+                log.info(f"第{iter_idx}轮筛选 - 回归模型: 使用训练集和验证集")
+                train_data_reg = lgb.Dataset(X_train_aug, y_train_reg)
+                val_data_reg = lgb.Dataset(X_val_aug, y_val_reg, reference=train_data_reg)
+                model_reg = lgb.train(params_reg, train_data_reg, valid_sets=[val_data_reg], 
+                                     num_boost_round=100, early_stopping_rounds=20, verbose_eval=False)
+            
+            # 训练方向模型
+            if len(X_val_aug) == 0 or len(y_val_dir) == 0:
+                log.info(f"第{iter_idx}轮筛选 - 方向模型: 无验证集，仅使用训练集")
+                train_data_dir = lgb.Dataset(X_train_aug, y_train_dir)
+                model_dir = lgb.train(params_dir, train_data_dir, 
+                                     num_boost_round=100, verbose_eval=False)
+            else:
+                log.info(f"第{iter_idx}轮筛选 - 方向模型: 使用训练集和验证集")
+                train_data_dir = lgb.Dataset(X_train_aug, y_train_dir)
+                val_data_dir = lgb.Dataset(X_val_aug, y_val_dir, reference=train_data_dir)
+                model_dir = lgb.train(params_dir, train_data_dir, valid_sets=[val_data_dir], 
+                                     num_boost_round=100, early_stopping_rounds=20, verbose_eval=False)
+            
+            # 获取特征重要性
+            imp_cls = model_cls.feature_importance(importance_type='gain')
+            imp_reg = model_reg.feature_importance(importance_type='gain')
+            imp_dir = model_dir.feature_importance(importance_type='gain')
+            
+            # 累积特征重要性
+            for idx, feat in enumerate(feature_names):
+                feature_importance_accum[feat] += (imp_cls[idx] + imp_reg[idx] + imp_dir[idx]) / 3.0
+        
+        # 计算噪声因子的平均重要性
+        noise_indices = list(range(len(feature_names), len(feature_names) + N_NOISE))
+        noise_avg_imp = (imp_cls[noise_indices].mean() + 
+                        imp_reg[noise_indices].mean() + 
+                        imp_dir[noise_indices].mean()) / 3.0
+        
+        # 统计特征重要性分布
+        all_imp_values = list(feature_importance_accum.values())
+        all_imp_mean = np.mean(all_imp_values) / N_ITER
+        all_imp_median = np.median(all_imp_values) / N_ITER
+        all_imp_std = np.std(all_imp_values) / N_ITER
+        
+        log.info(f"特征重要性统计: 均值={all_imp_mean:.4f}, 中位数={all_imp_median:.4f}, 标准差={all_imp_std:.4f}")
+        log.info(f"噪声特征平均重要性: {noise_avg_imp:.4f}")
+        
+        # 根据累积重要性筛选因子
+        selected_factors = []
+        removed_factors = []
+        
+        for feat, imp in feature_importance_accum.items():
+            avg_imp = imp / N_ITER
+            # 改进的筛选条件：使用中位数作为基准，而不是噪声平均值
+            if avg_imp > all_imp_median * 0.3:  # 重要性超过中位数的30%
+                selected_factors.append(feat)
+            else:
+                removed_factors.append((feat, avg_imp))
+        
+        # 如果筛选后因子太少，保留重要性前70%的因子
+        if len(selected_factors) < len(feature_names) * 0.3:  # 少于30%
+            factor_imp_list = sorted(feature_importance_accum.items(), 
+                                   key=lambda x: x[1], reverse=True)
+            n_factors = max(20, int(len(feature_names) * 0.7))  # 至少保留20个，最多保留70%
+            selected_factors = [feat for feat, _ in factor_imp_list[:n_factors]]
+            
+            # 记录被移除的因子
+            removed_factors = [(feat, imp/N_ITER) for feat, imp in factor_imp_list[n_factors:]]
+        
+        g.selected_factors = selected_factors
+        
+        if not g.selected_factors:
+            log.warning("因子筛选后无特征可用，使用原始特征")
+            g.selected_factors = feature_names
+        
+        log.info(f"筛选后特征数量: {len(g.selected_factors)} (保留{len(g.selected_factors)/len(feature_names)*100:.1f}%)")
+        
+        # 记录移除的因子
+        if removed_factors:
+            removed_factors_sorted = sorted(removed_factors, key=lambda x: x[1])
+            log.info(f"移除的Top 5最不重要因子:")
+            for feat, imp in removed_factors_sorted[:5]:
+                log.info(f"  {feat}: {imp:.4f}")
+        
+        log.info(f"Top 10 重要特征:")
+        factor_imp_list = sorted(feature_importance_accum.items(), 
+                               key=lambda x: x[1], reverse=True)
+        for feat, imp in factor_imp_list[:10]:
+            avg_imp = imp / N_ITER
+            log.info(f"  {feat}: {avg_imp:.4f}")
+        
+        # 训练最终模型
+        if len(g.selected_factors) > 0:
+            # 使用标准化后的数据训练最终模型
+            # 获取筛选后因子对应的列索引
+            selected_indices = [feature_names.index(f) for f in g.selected_factors]
+            X_train_final = X_train_raw_std[:, selected_indices]
+            X_val_final = X_val_raw_std[:, selected_indices]
+            
+            # 训练最终分类模型
+            log.info("开始训练最终分类模型...")
+            if len(X_val_final) == 0 or len(y_val_cls) == 0:
+                train_data_cls_final = lgb.Dataset(X_train_final, y_train_cls)
+                g.model_cls_final = lgb.train(params_cls, train_data_cls_final,
+                                             num_boost_round=100, verbose_eval=False)
+            else:
+                train_data_cls_final = lgb.Dataset(X_train_final, y_train_cls)
+                val_data_cls_final = lgb.Dataset(X_val_final, y_val_cls, reference=train_data_cls_final)
+                g.model_cls_final = lgb.train(params_cls, train_data_cls_final, valid_sets=[val_data_cls_final],
+                                             num_boost_round=100, early_stopping_rounds=20, verbose_eval=False)
+            
+            # 训练最终回归模型
+            log.info("开始训练最终回归模型...")
+            if len(X_val_final) == 0 or len(y_val_reg) == 0:
+                train_data_reg_final = lgb.Dataset(X_train_final, y_train_reg)
+                g.model_reg_final = lgb.train(params_reg, train_data_reg_final,
+                                             num_boost_round=100, verbose_eval=False)
+            else:
+                train_data_reg_final = lgb.Dataset(X_train_final, y_train_reg)
+                val_data_reg_final = lgb.Dataset(X_val_final, y_val_reg, reference=train_data_reg_final)
+                g.model_reg_final = lgb.train(params_reg, train_data_reg_final, valid_sets=[val_data_reg_final],
+                                             num_boost_round=100, early_stopping_rounds=20, verbose_eval=False)
+            
+            # 训练最终方向模型
+            log.info("开始训练最终方向模型...")
+            if len(X_val_final) == 0 or len(y_val_dir) == 0:
+                train_data_dir_final = lgb.Dataset(X_train_final, y_train_dir)
+                g.model_dir_final = lgb.train(params_dir, train_data_dir_final,
+                                             num_boost_round=100, verbose_eval=False)
+            else:
+                train_data_dir_final = lgb.Dataset(X_train_final, y_train_dir)
+                val_data_dir_final = lgb.Dataset(X_val_final, y_val_dir, reference=train_data_dir_final)
+                g.model_dir_final = lgb.train(params_dir, train_data_dir_final, valid_sets=[val_data_dir_final],
+                                             num_boost_round=100, early_stopping_rounds=20, verbose_eval=False)
+            
+            # 保存筛选的因子对应的标准化统计量
+            train_mean_selected = train_mean[0, selected_indices]
+            train_std_selected = train_std[0, selected_indices]
+            
+            g.train_stats_final = {
+                'mean': pd.Series(train_mean_selected, index=g.selected_factors),
+                'std': pd.Series(train_std_selected, index=g.selected_factors)
+            }
+            
+            # 永久保存筛选的因子
+            g.selected_factors_final = g.selected_factors.copy()
+            
+            log.info(f"模型训练完成，使用{len(g.selected_factors)}个因子，将一直使用该模型")
+        else:
+            log.warning("无有效特征，使用原始股票列表")
+            return initial_list
+    
+    # 预测阶段 - 使用训练好的模型进行预测
+    log.info("使用已训练模型进行预测...")
+    current_data = get_factor_data(initial_list, context.previous_date)
+    if current_data.empty:
+        log.warning("当前因子数据为空")
+        return initial_list
+    
+    # 使用训练统计量预处理当前数据
+    if hasattr(g, 'train_stats_final'):
+        current_data = preprocess_factors(current_data, context.previous_date, 
+                                         training=False, train_stats=g.train_stats_final)
+    else:
+        current_data = preprocess_factors(current_data, context.previous_date)
+    
+    log.info(f"预处理后数据形状: {current_data.shape}")
+    
+    # 使用保存的最终因子列表
+    available_features = [f for f in g.selected_factors_final if f in current_data.columns]
+    log.info(f"可用的筛选后特征数量: {len(available_features)}")
+    
+    if not available_features:
+        log.warning("筛选后的特征在当前数据中不存在，使用原始排序")
+        return initial_list
+    
+    current_data = current_data[available_features].fillna(0)
+    log.info(f"填充缺失值后数据形状: {current_data.shape}")
+    
+    if current_data.empty:
+        log.warning("填充缺失值后数据为空")
+        return initial_list
+    
+    # 模型预测
+    log.info("使用已训练模型进行预测...")
+    pred_cls = g.model_cls_final.predict(current_data.values.astype('float32'))
+    pred_reg = g.model_reg_final.predict(current_data.values.astype('float32'))
+    pred_dir = g.model_dir_final.predict(current_data.values.astype('float32'))
+    
+    log.info(f"预测结果: pred_cls形状: {pred_cls.shape}, pred_reg形状: {pred_reg.shape}, pred_dir形状: {pred_dir.shape}")
+    
+    # 计算综合得分
+    preds = np.column_stack([pred_cls, pred_reg, pred_dir])
+    
+    # 改进的得分计算：考虑不确定性
+    ai_score = preds.mean(axis=1)
+    consistency = preds.var(axis=1, ddof=0)
+    
+    # 不确定性调整：高不确定性时降低权重
+    uncertainty_weight = 1.0 / (1.0 + consistency * 10)
+    adjusted_score = ai_score * uncertainty_weight
+    
+    result_df = pd.DataFrame({
+        'AI_score': adjusted_score,
+        'consistency': consistency,
+        'raw_score': ai_score
+    }, index=current_data.index)
+    
+    log.info(f"结果DataFrame形状: {result_df.shape}")
+    log.info(f"AI_score统计: 均值={result_df['AI_score'].mean():.4f}, 标准差={result_df['AI_score'].std():.4f}")
+    log.info(f"一致性统计: 均值={result_df['consistency'].mean():.4f}, 标准差={result_df['consistency'].std():.4f}")
+    
+    # 根据不确定性进行筛选
+    avg_consistency = result_df['consistency'].mean()
+    log.info(f"平均一致性: {avg_consistency:.4f}")
+    
+    if avg_consistency > 0.005:
+        log.info("采用高不确定性筛选策略")
+        df_sorted_by_consistency = result_df.sort_values(by='consistency', ascending=True)
+        top_30_percent = int(0.3 * len(df_sorted_by_consistency))
+        log.info(f"取一致性最高的{top_30_percent}个股票")
+        df_candidate = df_sorted_by_consistency.head(top_30_percent)
+        df_selected = df_candidate.sort_values(by='AI_score', ascending=False)
+    else:
+        log.info("采用低不确定性筛选策略")
+        df_selected = result_df.sort_values(by='AI_score', ascending=False)
+    
+    # 最终选择
+    select_count = min(g.stock_num, len(df_selected))
+    df_selected = df_selected.head(select_count)
+    
+    log.info(f"最终选择股票数量: {len(df_selected)}")
+    
+    if len(df_selected) > 5:
+        top_stocks = df_selected.head(5)
+        for idx, row in top_stocks.iterrows():
+            stock_info = get_security_info(idx)
+            stock_name = stock_info.display_name if hasattr(stock_info, 'display_name') else idx
+            log.info(f"Top 5: {stock_name} - AI分数: {row['AI_score']:.4f}, 一致性: {row['consistency']:.4f}")
+    
+    if len(df_selected) == 0:
+        log.warning("最终选择股票列表为空，使用原始列表")
+        return initial_list
+    
+    return df_selected.index.tolist()
+
+def get_stock_list(context):
+    """选股模块 - 修复datetime错误"""
+    yesterday = context.previous_date
+    today = context.current_dt
+    
+    # 获取初始列表
+    initial_list = get_index_stocks('000985.XSHG', today)
+    p_count = 1
+    p_industries_type = 'sw_l1'
+    
+    if not initial_list:
+        log.info("中证全指成分股为空，转向ETF")
+        return g.foreign_ETF
+    
+    # 计算行业宽度
+    h = get_price(initial_list, end_date=yesterday, frequency='1d', 
+                  fields=['close'], count=p_count + 20, panel=False)
+    
+    if h.empty:
+        log.info("价格数据为空，转向ETF")
+        return g.foreign_ETF
+    
+    h['date'] = pd.DatetimeIndex(h.time).date
+    df_close = h.pivot(index='code', columns='date', values='close').dropna(axis=0)
+    
+    if df_close.empty:
+        log.info("数据透视为空，转向ETF")
+        return g.foreign_ETF
+    
+    df_ma20 = df_close.rolling(window=20, axis=1).mean().iloc[:, -p_count:]
+    df_bias = (df_close.iloc[:, -p_count:] > df_ma20) 
+    s_stk_2_ind = getStockIndustry(p_stocks=initial_list, p_industries_type=p_industries_type, p_day=yesterday)
+    df_bias['industry_code'] = s_stk_2_ind
+    
+    df_ratio = ((df_bias.groupby('industry_code').sum() * 100.0) / 
+                df_bias.groupby('industry_code').count()).round()  
+    
+    if df_ratio.empty:
+        log.info("行业宽度数据为空，转向ETF")
+        return g.foreign_ETF
+    
+    # 获取最后一列（最近一个交易日）的行业宽度
+    if len(df_ratio.columns) > 0:
+        latest_date = df_ratio.columns[-1]  # 使用实际的日期列
+        top_values = df_ratio[latest_date].nlargest(g.num)
+    else:
+        log.info("行业宽度没有可用列，转向ETF")
+        return g.foreign_ETF
+    
+    I = top_values.index.tolist()
+    
+    # 关键修改：将原有的判断条件与风险监测结果结合
+    # 1. 计算风险指标
+    risk_data = g.risk_monitor.calculate_risk_indicators(context, yesterday)
+    risk_level = risk_data['risk_level']
+    concentration_ratio = risk_data['concentration_ratio']
+    market_breadth = risk_data['market_breadth']
+    
+    # 2. 获取领涨行业名称
+    leading_industry = I[0] if I else None
+    
+    # 3. 判断市场环境
+    market_env = judge_market_env(context)
+    
+    # 4. 综合判断逻辑
+    should_switch_to_etf = False
+    reason = ""
+    
+    # 条件A：高风险信号
+    if risk_level >= 2:
+        should_switch_to_etf = True
+        reason = f"高风险信号(等级{risk_level})，集中度{concentration_ratio:.2f}，市场宽度{market_breadth:.2f}"
+    
+    # 条件B：原策略的判断条件（存量市场+四大行业领涨），但结合风险指标优化
+    elif market_env == '存量' and leading_industry in ['801780', '801050', '801950', '801040']:
+        # 当存量市场且四大行业领涨时，用风险指标进一步确认
+        if risk_level >= 1:  # 中等以上风险确认
+            should_switch_to_etf = True
+            reason = f"存量市场+{g.SW1.get(leading_industry, '四大行业')}领涨，风险等级{risk_level}"
+        elif concentration_ratio > 1.1:  # 集中度过高
+            should_switch_to_etf = True
+            reason = f"存量市场+四大行业领涨，集中度{concentration_ratio:.2f}过高"
+        elif market_breadth < 0.55:  # 市场宽度过窄
+            should_switch_to_etf = True
+            reason = f"存量市场+四大行业领涨，市场宽度{market_breadth:.2f}过窄"
+    
+    # 条件C：集中度极端高的情况
+    elif concentration_ratio > 1.3:
+        should_switch_to_etf = True
+        reason = f"极端集中度{concentration_ratio:.2f}"
+    
+    if should_switch_to_etf:
+        # 根据风险等级选择ETF池
+        if risk_level >= 2:
+            etf_candidates = g.etf_pool['defensive']
+        elif risk_level == 1:
+            etf_candidates = g.etf_pool['balanced']
+        else:
+            etf_candidates = g.etf_pool['offensive']
+        
+        # 选择最强ETF
+        etf_list = select_best_etf(context, etf_candidates, top_n=2)
+        
+        log.info(f"转向ETF | 原因: {reason} | 风险等级: {risk_level} | 选择: {etf_list}")
+        
+        return etf_list
+    
+    # 正常选股逻辑
+    S_stocks = get_index_stocks('399101.XSHE', today)
+    stocks = filter_kcbj_stock(S_stocks)
+    choice = filter_st_stock(stocks)
+    choice = filter_new_stock(context, choice)
+    
+    # 记录行业宽度信息
+    if I:
+        industry_names = [g.SW1.get(code, '未知') for code in I]
+        log.info(f"领涨行业: {industry_names}, 市场宽度: {market_breadth:.2f}, 集中度: {concentration_ratio:.2f}")
+    
+    if not choice:
+        log.info("筛选后无可用股票，转向ETF")
+        return select_best_etf(context, g.etf_pool['balanced'], top_n=2)
+    
+    # 基本面筛选
+    BIG_stock_list = get_fundamentals(query(
+        valuation.code,
+    ).filter(
+        valuation.code.in_(choice),
+        indicator.roe > 0.15,
+        indicator.roa > 0.10,
+    ).order_by(
+        valuation.market_cap.asc()
+    ).limit(20)).set_index('code').index.tolist()
+    
+    if not BIG_stock_list:
+        log.info("基本面筛选后无股票，转向ETF")
+        return select_best_etf(context, g.etf_pool['balanced'], top_n=2)
+    
+    BIG_stock_list = filter_paused_stock(BIG_stock_list)
+    BIG_stock_list = filter_limitup_stock(context, BIG_stock_list)
+    BIG_stock_list = filter_limitdown_stock(context, BIG_stock_list)
+    
+    L = rank_stocks(context, BIG_stock_list)
+    
+    if not L:
+        log.info("过滤后无可用股票，转向ETF")
+        return select_best_etf(context, g.etf_pool['balanced'], top_n=2)
+    
+    return L
+
+def weekly_adjustment(context):
+    """周度调仓"""
+    target_B = get_stock_list(context)
+    
+    # 获取当前风险级别
+    risk_data = g.risk_monitor.calculate_risk_indicators(context)
+    risk_level = risk_data['risk_level']
+    
+    # 根据风险级别调整仓位
+    if risk_level >= 2:
+        target_position_ratio = 0.5  # 高风险时50%仓位
+        log.info(f"高风险(等级{risk_level})，降低仓位至50%")
+    elif risk_level == 1:
+        target_position_ratio = 0.8  # 中等风险时80%仓位
+        log.info(f"中等风险(等级{risk_level})，降低仓位至80%")
+    else:
+        target_position_ratio = 1.0  # 正常时满仓
+    
+    # 调仓卖出不在目标列表中的股票
+    for stock in g.hold_list:
+        if (stock not in target_B) and (stock not in g.yesterday_HL_list):
+            position = context.portfolio.positions[stock]
+            close_position(position)
+    
+    # 计算目标持仓价值
+    total_value = context.portfolio.total_value
+    target_total_value = total_value * target_position_ratio
+    current_position_value = sum([p.value for p in context.portfolio.positions.values()])
+    
+    # 如果需要减仓
+    if current_position_value > target_total_value:
+        excess_ratio = (current_position_value - target_total_value) / current_position_value
+        
+        for stock in list(context.portfolio.positions.keys()):
+            position = context.portfolio.positions[stock]
+            current_hold_value = position.value
+            
+            # 计算目标市值
+            target_value = current_hold_value * (1 - excess_ratio)
+            
+            # 计算需要卖出的市值
+            sell_value = current_hold_value - target_value
+            
+            # 获取当前价格，计算最小交易单位金额
+            current_data = get_current_data()
+            current_price = current_data[stock].last_price
+            
+            if current_price > 0:
+                min_trade_amount = current_price * 100  # 1手=100股
+                
+                # 如果目标市值小于1手金额，则完全清仓
+                if target_value < min_trade_amount:
+                    log.info(f"{stock}降仓后剩余市值{target_value:.2f}小于1手金额{min_trade_amount:.2f}，完全清仓")
+                    order_target_value(stock, 0)
+                else:
+                    # 否则正常卖出部分仓位
+                    order_target_value(stock, target_value)
+            else:
+                # 如果获取不到价格，按原逻辑处理
+                order_target_value(stock, target_value)
+    
+    # 调仓买入
+    position_count = len(context.portfolio.positions)
+    target_num = min(len(target_B), g.stock_num)
+    
+    if target_num > position_count:
+        buy_num = min(len(target_B), g.stock_num - position_count)
+        available_cash = min(context.portfolio.cash, target_total_value - current_position_value)
+        if available_cash > 0 and buy_num > 0:
+            value = available_cash / buy_num
+            for stock in target_B:
+                if stock not in list(context.portfolio.positions.keys()):
+                    if open_position(stock, value):
+                        if len(context.portfolio.positions) == target_num:
+                            break
+
+def check_limit_up(context):
+    now_time = context.current_dt
+    if g.yesterday_HL_list:
+        for stock in g.yesterday_HL_list:
+            current_data = get_price(stock, end_date=now_time, frequency='1m', 
+                                     fields=['close', 'high_limit'], skip_paused=False, 
+                                     fq='pre', count=1, panel=False, fill_paused=True)
+            if current_data.iloc[0, 0] < current_data.iloc[0, 1]:
+                log.info("[%s]涨停打开，卖出" % (stock))
+                position = context.portfolio.positions[stock]
+                close_position(position)
+            else:
+                log.info("[%s]涨停，继续持有" % (stock))
+
+def check_risk(context):
+    today = context.current_dt
+    positions = context.portfolio.positions
+    
+    if len(positions) == 0:
+        return
+    
+    # 获取风险级别和市场宽度
+    risk_data = g.risk_monitor.calculate_risk_indicators(context)
+    risk_level = risk_data['risk_level']
+    market_breadth = risk_data['market_breadth']
+    
+    for stock, position in positions.items():
+        cost_price = position.avg_cost
+        current_price = position.price
+        
+        if cost_price > 0 and current_price > 0:
+            pnl = (current_price - cost_price) / cost_price
+            
+            # 1. 止损逻辑
+            if risk_level >= 2:
+                stop_loss = -0.03
+            elif risk_level == 1:
+                stop_loss = -0.04
+            else:
+                stop_loss = -0.05
+            
+            if pnl < stop_loss:
+                log.info(f"止损: {stock}, 亏损: {pnl:.2%}")
+                order_target_value(stock, 0)
+                continue
+            
+            # 2. 止盈逻辑
+            # 获取个股动量数据
+            momentum_data = get_price(stock, end_date=context.previous_date, count=20, 
+                                     fields=['close'], panel=False)
+            if len(momentum_data) >= 20:
+                momentum_return = momentum_data['close'].iloc[-1] / momentum_data['close'].iloc[0] - 1
+            else:
+                momentum_return = 0
+            
+            # 优化止盈条件
+            should_take_profit = False
+            profit_reason = ""
+            target_ratio = 1.0  # 默认卖出比例
+            
+            if pnl > 0.35:
+                # 高盈利时，如果市场宽度好（>0.6）且动量强（>5%），继续持有
+                if market_breadth > 0.6 and momentum_return > 0.05:
+                    log.info(f"高盈利{stock}继续持有: 盈利{pnl:.2%}, 动量{momentum_return:.2%}, 市场宽度{market_breadth:.2f}")
+                else:
+                    should_take_profit = True
+                    profit_reason = f"高盈利止盈: 盈利{pnl:.2%}"
+                    if market_breadth > 0.6 and momentum_return > 0.05:
+                        target_ratio = 0.5  # 卖出50%
+                    else:
+                        target_ratio = 0.7  # 卖出70%
+            elif pnl > 0.50:
+                # 中等盈利时，如果市场宽度非常好（>0.7）且动量非常强（>8%），继续持有
+                if market_breadth > 0.7 and momentum_return > 0.08:
+                    log.info(f"中盈利{stock}继续持有: 盈利{pnl:.2%}, 动量{momentum_return:.2%}, 市场宽度{market_breadth:.2f}")
+                else:
+                    should_take_profit = True
+                    profit_reason = f"中盈利止盈: 盈利{pnl:.2%}"
+                    if market_breadth > 0.7 and momentum_return > 0.08:
+                        target_ratio = 0.8  # 卖出20%（保留80%）
+                    else:
+                        target_ratio = 0.8  # 卖出20%（保留80%）
+            
+            if should_take_profit:
+                log.info(profit_reason)
+                current_value = position.value
+                target_value = current_value * target_ratio
+                
+                # 计算目标股数
+                target_shares = int(target_value / current_price)
+                
+                # 检查是否满足最小交易单位
+                if target_shares < 100 or target_value < current_price * 100:
+                    # 卖出后不足1手，完全清仓
+                    log.info(f"{stock}部分止盈后剩余持仓不足1手，完全清仓")
+                    order_target_value(stock, 0)
+                else:
+                    # 卖出部分仓位
+                    order_target_value(stock, target_value)
+
+def get_factor_data(securities_list, date):
+    """获取因子数据，包含基础因子和自定义技术因子"""
+    # 获取基础因子
+    factor_data = get_factor_values(securities=securities_list, \
+                                    factors=g.factor_list, \
+                                    count=1, \
+                                    end_date=date)
+    df_jq_factor = pd.DataFrame(index=securities_list)
+    for i in factor_data.keys():
+        df_jq_factor[i] = factor_data[i].iloc[0, :]
+    return df_jq_factor
+
+# =========================
+# 3️⃣ 辅助函数
+# =========================
+def order_target_value_(security, value):
+    if value == 0:
+        log.debug("Selling out %s" % (security))
+    else:
+        log.debug("Order %s to value %f" % (security, value))
+    return order_target_value(security, value)
+
+def open_position(security, value):
+    order = order_target_value_(security, value)
+    if order != None and order.filled > 0:
+        return True
+    return False
+
+def close_position(position):
+    security = position.security
+    order = order_target_value_(security, 0)
+    if order != None:
+        if order.status == OrderStatus.held and order.filled == order.amount:
+            return True
+    return False
+
+def filter_paused_stock(stock_list):
+    current_data = get_current_data()
+    return [stock for stock in stock_list if not current_data[stock].paused]
+
+def filter_st_stock(stock_list):
+    current_data = get_current_data()
+    return [stock for stock in stock_list
+            if not current_data[stock].is_st
+            and 'ST' not in current_data[stock].name
+            and '*' not in current_data[stock].name
+            and '退' not in current_data[stock].name]
+
+def filter_kcbj_stock(stock_list):
+    for stock in stock_list[:]:
+        if stock[0] == '4' or stock[0] == '8' or stock[:2] == '68' or stock[0] == '3':
+            stock_list.remove(stock)
+    return stock_list
+
+def filter_limitup_stock(context, stock_list):
+    last_prices = history(1, unit='1m', field='close', security_list=stock_list)
+    current_data = get_current_data()
+    return [stock for stock in stock_list if stock in context.portfolio.positions.keys()
+            or last_prices[stock][-1] < current_data[stock].high_limit]
+
+def filter_limitdown_stock(context, stock_list):
+    last_prices = history(1, unit='1m', field='close', security_list=stock_list)
+    current_data = get_current_data()
+    return [stock for stock in stock_list if stock in context.portfolio.positions.keys()
+            or last_prices[stock][-1] > current_data[stock].low_limit]
+
+def filter_new_stock(context, stock_list):
+    """过滤次新股 - 修复timedelta错误"""
+    yesterday = context.previous_date
+    return [stock for stock in stock_list if
+            not yesterday - get_security_info(stock).start_date < timedelta(days=375)]

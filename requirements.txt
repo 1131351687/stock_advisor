@@ -1,0 +1,8 @@
+hikyuu>=2.0.0              # A 股量化数据库 (主要数据源)
+akshare>=1.11.0             # 备选数据源 (网络 API)
+numpy>=1.24.0
+pandas>=2.0.0
+PySide6>=6.4.0              # GUI 界面
+matplotlib>=3.7.0           # 图表绘制
+h5py>=3.7.0                 # HDF5 文件格式
+pytdx>=0.48                 # 通达信 API

@@ -27,6 +27,17 @@ env/
 启动日志.txt
 *.sqlite3
 *.db
+*.h5                        # HDF5 数据文件
+*.hdf5
+
+# Data directories
+data/
+cache/
+
+# IDEs and editors
+.vscode/
+.idea/
+.claude/
 
 # Testing
 .pytest_cache/
@@ -49,6 +60,7 @@ secrets.yaml
 credentials.json
 *.pem
 *.key
+config/config.yaml          # 敏感配置文件
 
 # Compiled files
 *.so

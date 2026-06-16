@@ -34,12 +34,40 @@ def connect_tdx():
     """尝试连接通达信，返回 api 实例"""
     from pytdx.hq import TdxHq_API
 
-    for ip, port in TDX_SERVERS:
-        log(f"  尝试连接 {ip}:{port} ...")
+    # 1. 尝试使用 pytdx 自带的寻优选择最快服务器
+    try:
+        log("  正在获取最优行情服务器 (select_best_ip) ...")
+        from pytdx.util.best_ip import select_best_ip
+        best_ip = select_best_ip()
+        if best_ip and 'ip' in best_ip and 'port' in best_ip:
+            ip, port = best_ip['ip'], best_ip['port']
+            log(f"  + 找到最优服务器: {ip}:{port}")
+            api = TdxHq_API()
+            if api.connect(ip, port):
+                log(f"  + 连接成功 ({ip}:{port})")
+                return api
+    except Exception as e:
+        log(f"  自动获取最优服务器失败: {e}，将尝试备用服务器列表")
+
+    # 2. 备用静态列表（包含目前已知的可用好服务器）
+    fallback_servers = [
+        ("60.12.136.250", 7709),
+        ("115.238.56.198", 7709),
+        ("115.238.90.165", 7709),
+        ("180.153.18.170", 7709),
+        ("218.75.126.9", 7709),
+        ("60.191.117.167", 7709),
+        ("jstdx.gtjas.com", 7709),
+        ("shtdx.gtjas.com", 7709),
+        ("sztdx.gtjas.com", 7709),
+    ] + TDX_SERVERS
+
+    for ip, port in fallback_servers:
+        log(f"  尝试连接备用 {ip}:{port} ...")
         api = TdxHq_API()
         try:
             if api.connect(ip, port):
-                log(f"  ✓ 连接成功 ({ip}:{port})")
+                log(f"  + 连接成功 ({ip}:{port})")
                 return api
             api.disconnect()
         except Exception:
@@ -128,7 +156,7 @@ def main():
     log("\n[1/5] 更新指数代码表...")
     try:
         n = import_index_name(connect)
-        log(f"  ✓ 指数个数: {n}")
+        log(f"  + 指数个数: {n}")
     except Exception as e:
         log(f"  [跳过] {e}")
 
@@ -137,7 +165,7 @@ def main():
     for mkt in ("SH", "SZ"):
         try:
             n = import_stock_name(connect, api, mkt, quotations)
-            log(f"  ✓ {mkt}: 处理 {n} 只")
+            log(f"  + {mkt}: 处理 {n} 只")
         except Exception as e:
             log(f"  [跳过] {mkt}: {e}")
 
@@ -149,7 +177,7 @@ def main():
             t0 = time.time()
             n = import_data(connect, mkt, "DAY", quotations, api, DEST_DIR)
             elapsed = time.time() - t0
-            log(f"  ✓ {mkt} 新增 {n} 条记录 (耗时 {elapsed:.0f}s)")
+            log(f"  + {mkt} 新增 {n} 条记录 (耗时 {elapsed:.0f}s)")
         except Exception as e:
             log(f"  [跳过] {mkt}: {e}")
 
@@ -158,7 +186,7 @@ def main():
     for mkt in ("SH", "SZ"):
         try:
             n = pytdx_import_finance_to_sqlite(connect, api, mkt)
-            log(f"  ✓ {mkt} 新增 {n} 条")
+            log(f"  + {mkt} 新增 {n} 条")
         except Exception as e:
             log(f"  [跳过] {mkt}: {e}")
 
@@ -166,8 +194,8 @@ def main():
     log("\n[5/5] 更新板块成分数据...")
     try:
         from hikyuu.data.download_block import download_block_info
-        download_block_info(connect, DEST_DIR)
-        log(f"  ✓ 板块数据更新完成")
+        download_block_info()
+        log(f"  + 板块数据更新完成")
     except Exception as e:
         log(f"  [跳过] {e}")
 

@@ -7,7 +7,7 @@ import json
 from datetime import datetime
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QTimer
+from PySide6.QtCore import Qt, QTimer, QThread, Signal
 from PySide6.QtGui import QFont, QIcon, QColor
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -31,6 +31,7 @@ from trade_advisor.storage import (
 )
 from trade_advisor.backtest import run_backtest, BacktestResult
 from trade_advisor.strategies import _get_last_trade_date
+from trade_advisor.data_status import get_db_latest_dates, get_data_freshness
 
 # matplotlib 嵌入 Qt
 import matplotlib
@@ -268,6 +269,62 @@ class DecisionDialog(QDialog):
         }
 
 
+# ── 数据更新后台线程 ──
+class DataUpdateThread(QThread):
+    """在后台线程中执行数据更新"""
+    log_updated = Signal(str)
+    finished = Signal(bool)
+    status_reset = Signal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+
+    def run(self):
+        """在线程中运行 update_data.main"""
+        import sys
+        import os
+
+        # 重定向 print 到 signal
+        original_stdout = sys.stdout
+
+        class SignalWriter:
+            def __init__(self, signal, original):
+                self.signal = signal
+                self.original = original
+                self.buffer = ""
+
+            def write(self, msg):
+                self.original.write(msg)
+                if msg.strip():
+                    self.signal.emit(msg.strip())
+
+            def flush(self):
+                self.original.flush()
+
+        sys.stdout = SignalWriter(self.log_updated, original_stdout)
+
+        try:
+            # 动态导入 update_data 并执行
+            proj_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            sys.path.insert(0, proj_root)
+
+            import importlib.util
+            spec = importlib.util.spec_from_file_location(
+                "update_data",
+                os.path.join(proj_root, "update_data.py")
+            )
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            mod.main()
+            self.finished.emit(True)
+        except Exception as e:
+            self.log_updated.emit(f"❌ 更新失败: {e}")
+            self.finished.emit(False)
+        finally:
+            sys.stdout = original_stdout
+            self.status_reset.emit()
+
+
 # ── 主窗口 ──
 class MainWindow(QMainWindow):
     def __init__(self):
@@ -286,6 +343,9 @@ class MainWindow(QMainWindow):
 
         # 初始化数据库
         init_db()
+
+        # 显示数据库状态
+        self.refresh_db_status()
 
     def setup_ui(self):
         central = QWidget()
@@ -356,11 +416,40 @@ class MainWindow(QMainWindow):
         self.run_btn.clicked.connect(self.on_run_strategy)
         tl.addWidget(self.run_btn)
 
+        # ── 数据库分隔 ──
+        sep = QFrame()
+        sep.setFrameShape(QFrame.VLine)
+        sep.setStyleSheet("color: #7f8c8d;")
+        tl.addWidget(sep)
+
+        # ── 数据库状态 ──
+        self.db_status_icon = QLabel("💾")
+        self.db_status_icon.setStyleSheet("color: white; font-size: 14px;")
+        tl.addWidget(self.db_status_icon)
+
+        self.db_status_label = QLabel("检测中...")
+        self.db_status_label.setStyleSheet("color: #bdc3c7; font-size: 11px;")
+        tl.addWidget(self.db_status_label)
+
+        # ── 更新数据按钮 ──
+        self.update_db_btn = QPushButton("🔄 更新数据")
+        self.update_db_btn.setStyleSheet(
+            "background: #8e44ad; color: white; font-weight: bold; padding: 6px 14px;"
+        )
+        self.update_db_btn.clicked.connect(self.on_update_data)
+        tl.addWidget(self.update_db_btn)
+
         parent_layout.addWidget(toolbar)
 
     def setup_statusbar(self):
         self.status = QStatusBar()
         self.setStatusBar(self.status)
+
+        # 永久数据库日期信息
+        self.db_bar_label = QLabel()
+        self.db_bar_label.setStyleSheet("color: #ecf0f1; font-size: 11px;")
+        self.status.addPermanentWidget(self.db_bar_label)
+
         self.status.showMessage("就绪")
 
     def setup_timer(self):
@@ -370,7 +459,89 @@ class MainWindow(QMainWindow):
         self.timer.start(60000)  # 每分钟
 
     def update_status(self):
-        pass  # 预留
+        """定时刷新数据库状态"""
+        self.refresh_db_status()
+
+    def refresh_db_status(self):
+        """刷新数据库状态显示"""
+        try:
+            freshness = get_data_freshness()
+            dates = get_db_latest_dates()
+
+            # 工具条状态
+            latest = freshness['latest_date']
+            self.db_status_label.setText(f"{latest} | {freshness['status_label']}")
+            self.db_status_label.setStyleSheet(
+                f"color: {freshness['status_color']}; font-size: 11px; font-weight: bold;"
+            )
+
+            # 状态栏永久信息
+            self.db_bar_label.setText(
+                f"  上证: {dates['sh']}  |  深证: {dates['sz']}  |  最新: {latest}  "
+            )
+        except Exception as e:
+            self.db_status_label.setText("检测失败")
+            self.db_bar_label.setText("数据库状态未知")
+
+    def on_update_data(self):
+        """启动数据更新（后台线程）"""
+        # 禁用按钮防止重复点击
+        self.update_db_btn.setEnabled(False)
+        self.update_db_btn.setText("⏳ 更新中...")
+        self.run_btn.setEnabled(False)
+
+        # 弹出进度对话框
+        self.update_dialog = QDialog(self)
+        self.update_dialog.setWindowTitle("数据更新")
+        self.update_dialog.setMinimumWidth(600)
+        self.update_dialog.setMinimumHeight(400)
+        layout = QVBoxLayout(self.update_dialog)
+
+        title = QLabel("⏳ 正在更新 Hikyuu 数据库...\n请耐心等待，K线数据更新需要较长时间")
+        title.setStyleSheet("font-weight: bold; color: #2c3e50; padding: 8px;")
+        layout.addWidget(title)
+
+        self.update_log = QTextEdit()
+        self.update_log.setReadOnly(True)
+        self.update_log.setStyleSheet("font-family: Consolas; font-size: 11px; background: #1e1e1e; color: #d4d4d4;")
+        layout.addWidget(self.update_log, 1)
+
+        close_btn = QPushButton("后台运行")
+        close_btn.clicked.connect(self.update_dialog.accept)
+        layout.addWidget(close_btn)
+
+        self.update_dialog.show()
+
+        # 启动线程
+        self.update_thread = DataUpdateThread(self)
+        self.update_thread.log_updated.connect(self._on_update_log)
+        self.update_thread.finished.connect(self._on_update_finished)
+        self.update_thread.start()
+
+    def _on_update_log(self, msg):
+        """数据更新日志回调"""
+        self.update_log.append(msg)
+        # 自动滚动到底部
+        scrollbar = self.update_log.verticalScrollBar()
+        scrollbar.setValue(scrollbar.maximum())
+        QApplication.processEvents()
+
+    def _on_update_finished(self, success):
+        """数据更新完成回调"""
+        self.update_db_btn.setEnabled(True)
+        self.update_db_btn.setText("🔄 更新数据")
+        self.run_btn.setEnabled(True)
+
+        if success:
+            self.update_log.append("\n✅ 数据更新完成！自动关闭此窗口...")
+            # 刷新状态
+            self.refresh_db_status()
+            self.status.showMessage("数据更新完成", 5000)
+            # 1.5秒后自动关闭
+            QTimer.singleShot(1500, self.update_dialog.accept)
+        else:
+            self.update_log.append("\n❌ 更新出错，请检查网络后重试")
+            self.status.showMessage("数据更新失败", 5000)
 
     # ── 今日决策 Tab ──
     def setup_today_tab(self):
